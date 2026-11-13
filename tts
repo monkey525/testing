@@ -1,0 +1,593 @@
+--@name SFX TTS
+--@author Bonyoze
+--@shared
+
+-- v1.3.0 (DECTalk TTS, selectable Moonbase-style voice tags and startup demo)
+
+local HIDE_CHAT = false -- true/false
+
+-- voice settings
+local TTS_MODE = 1 -- LOCKED: DECTalk only
+local MAX_CHAT_CHARS = 240
+local MAX_TTS_QUEUE = 8
+local MAX_BASS_QUEUE = 12
+local MAX_HTTP_QUEUE = 40
+local MAX_HTTP_CONCURRENT = 2
+local VOLUME = 5-- 0 - 10
+local PITCH = 1 -- playback pitch multiplier (1 = normal)
+local SHAKY_VOICE = false -- random pitch variation per spoken audio segment
+local SHAKY_AMOUNT = 0.15 -- +/- 15 percent pitch variation
+
+-- DECTalk is the only supported voice in this optimized version.
+
+-- probably shouldn't modify these
+local DIR = "sfx_tts" -- directory for the script (relative to data/sf_filedata)
+local SIGNATURE = "garry" -- unique string prepended to the temp file name (can be anything)
+local BASS_MAX = 20 -- max amount of bass objects at once before they queue (20 is the default for sf_bass_max_cl)
+
+if SERVER then
+    local audioCache = {}
+    
+    local streamQueue, awaitingReqs, requests = {}, {}, {}
+    
+    function handleFileSending()
+        for k, v in pairs(awaitingReqs) do
+            if not audioCache[k] then return end
+        
+            local clients = {}
+            
+            for kk, vv in pairs(v) do -- take out ready clients
+                if not vv:isValid() then
+                    table.remove(v, kk)
+                elseif vv.ready then
+                    table.insert(clients, vv)
+                    table.remove(v, kk)
+                    vv.ready = false
+                end
+            end
+            
+            if #clients > 0 then
+                local fileInfo = bit.compress(k)
+                
+                net.start("fileInfo")
+                    net.writeData(fileInfo, #fileInfo)
+                net.send(clients, false)
+                
+                net.start("fileData")
+                    net.writeStream(audioCache[k])
+                net.send(clients, false)
+            end
+        end
+    end
+    
+    hook.add("PlayerSay", "", function(ply, text)
+        if ply == owner() then
+            text = string.trim(text)
+            if #text == 0 then return end
+            -- Commands are handled by the owner's client; ordinary chat is spoken.
+            if #text > MAX_CHAT_CHARS and string.sub(text, 1, 1) != "!" then
+                text = string.sub(text, 1, MAX_CHAT_CHARS)
+            end
+            net.start("say")
+                net.writeString(text)
+            net.send(owner(), false)
+            if HIDE_CHAT then return "" end
+        end
+    end)
+
+    -- Only the owner may change playback settings; relay them to every client.
+    net.receive("settings", function(_, ply)
+        if ply != owner() then return end
+        local setting = net.readString()
+        net.start("settings")
+            net.writeString(setting)
+        net.send(find.allPlayers(), false)
+    end)
+    
+    net.receive("tts", function(len)
+        len = math.ceil(len / 8)
+        net.start("tts")
+            net.writeData(net.readData(len), len)
+        net.send(find.allPlayers(), false)
+    end)
+    
+    net.receive("request", function(len, ply)
+        len = math.ceil(len / 8)
+        local data = net.readData(len)
+        
+        local tbl = bit.stringToTable(bit.decompress(data))
+        
+        for k, v in pairs(tbl) do
+            if not awaitingReqs[v] and not requests[v] then
+                requests[v] = true
+            end
+                
+            if not awaitingReqs[v] then
+                awaitingReqs[v] = {}
+            end
+            table.insert(awaitingReqs[v], ply)
+        end
+    end)
+    
+    local lastFileName
+    
+    net.receive("fileInfo", function(len)
+        len = math.ceil(len / 8)
+        lastFileName = bit.decompress(net.readData(len))
+    end)
+    
+    net.receive("fileData", function(len)
+        len = math.ceil(len / 8)
+        net.readStream(function(stream)
+            audioCache[lastFileName] = stream
+            
+            handleFileSending()
+            
+            net.start("ready")
+            net.send(owner(), false)
+        end)
+    end)
+    
+    net.receive("ready", function(_, ply)
+        ply.ready = true
+    end)
+    
+    timer.create("handleReqs", 0, 0, function()
+        local reqs = table.getKeys(requests)
+        if #reqs == 0 then return end
+        
+        local req = reqs[1]
+        if audioCache[req] then
+            handleFileSending()
+        else
+            local data = bit.compress(req)
+            
+            net.start("request")
+                net.writeData(data, #data)
+            net.send(owner(), false)
+        end
+        
+        requests[req] = nil
+    end)
+    
+    timer.create("handleFileSending", 0, 0, handleFileSending)
+    
+    net.receive("test", function(len, ply)
+        print(ply, net.readString())
+    end)
+else
+    local ttsQueue, bassQueue = {}, {}
+    
+    local function playNextInQueue()
+        if #bassQueue == 0 then return end
+            
+        local item = bassQueue[1]
+        
+        local function handleBass(snd, err, msg)
+            if snd then
+                snd:setPos(owner():getPos())
+                snd:setVolume(VOLUME)
+                local appliedPitch = PITCH
+                if SHAKY_VOICE then
+                    appliedPitch = PITCH * (1 + (math.random() * 2 - 1) * SHAKY_AMOUNT)
+                end
+                appliedPitch = math.max(0.25, math.min(3, appliedPitch))
+                snd:setPitch(appliedPitch)
+                snd:play()
+
+                timer.simple(snd:getLength() * (1 / appliedPitch) / 1.25, function()
+                    playNextInQueue()
+                end)
+
+                timer.simple(snd:getLength() * (1 / appliedPitch), function()
+                    snd:stop()
+                end)
+            else
+                print("BASS ERROR: ", err, msg)
+                playNextInQueue()
+            end
+        end
+        
+        local filePath
+        
+        if player() == owner() and file.exists(DIR .. "/samples/" .. item .. ".mp3") then
+            filePath = "data/sf_filedata/" .. DIR .. "/samples/" .. item .. ".mp3"
+        else
+            filePath = file.existsTemp(SIGNATURE .. "_" .. item .. ".mp3")
+        end
+        
+        bass.loadFile(filePath, "3d", handleBass)
+        
+        table.remove(bassQueue, 1)
+    end
+    
+    local function listMissingAudio(data)
+        local hash = {}
+            
+        for k, v in pairs(data) do
+            if not hash[v] and not (player() == owner() and file.exists(DIR .. "/samples/" .. v .. ".mp3")) and not file.existsTemp(SIGNATURE .. "_" .. v .. ".mp3") then
+                hash[v] = true
+            end
+        end
+        
+        return table.getKeys(hash)
+    end
+    
+    local function handleTTS()
+        if #ttsQueue == 0 then return end
+            
+        local item = ttsQueue[1]
+        
+        if #listMissingAudio(item) != 0 then return end
+        
+        table.add(bassQueue, item)
+            
+        if bass.soundsLeft() == BASS_MAX then
+            playNextInQueue()
+        end
+            
+        table.remove(ttsQueue, 1)
+    end
+
+    if player() == owner() then
+        file.createDir(DIR)
+        file.createDir(DIR .. "/samples")
+        if not file.exists(DIR .. "/aliases.json") then file.write(DIR .. "/aliases.json", json.encode({}, true)) end
+        
+        local aliasData, aliasList, aliasLookup = json.decode(file.read(DIR .. "/aliases.json")), {}, {}
+        
+        for k, v in pairs(aliasData) do -- reformat alias data
+            for kk, vv in ipairs(v) do
+                table.insert(aliasList, "" .. vv)
+                aliasLookup[string.lower(vv)] = "" .. k
+            end
+        end
+        
+        table.sort(aliasList, function(a, b) return #a > #b end)
+        
+        local canStream = true
+        local httpQueue, streamQueue, fileRequests = {}, {}, {}
+        
+        local function generateVoiceHash(text)
+            return bit.sha256(text .. "dectalk")
+        end
+
+        local dectalkURL = "https://tts.cyzon.us/tts"
+
+        local function buildVoiceURL(text)
+            return dectalkURL .. "?text=" .. http.urlEncode(text)
+        end
+
+        function handleStreams()
+            if #streamQueue == 0 or not canStream then return end
+            
+            local name = streamQueue[1]
+            
+            local fileInfo, fileData = bit.compress(name), file.read(DIR .. "/samples/" .. name .. ".mp3") or file.readTemp(SIGNATURE .. "_" .. name .. ".mp3")
+            
+            net.start("fileInfo")
+                net.writeData(fileInfo, #fileInfo)
+            net.send(nil, false)
+            
+            net.start("fileData")
+                net.writeStream(fileData)
+            net.send(nil, false)
+            
+            table.remove(streamQueue, 1)
+            canStream = false
+        end
+        
+        local function checkFileReq(name)
+            for k, v in pairs(fileRequests) do
+                if v == name then
+                    table.insert(streamQueue, v)
+                    table.remove(fileRequests, k)
+                    handleStreams()
+                    return
+                end
+            end
+        end
+        
+        local httpInFlight = 0
+
+        function handleHttpReqs()
+            if #httpQueue == 0 or httpInFlight >= MAX_HTTP_CONCURRENT or not http.canRequest() then return end
+            local item = table.remove(httpQueue, 1)
+            httpInFlight = httpInFlight + 1
+            http.get(buildVoiceURL(item.text),
+                function(body, _, _, code)
+                    httpInFlight = math.max(0, httpInFlight - 1)
+                    if code == 200 and body and #body > 0 then
+                        file.writeTemp(SIGNATURE .. "_" .. item.hash .. ".mp3", body)
+                        checkFileReq(item.hash)
+                    else
+                        print("DECTalk HTTP ERROR: received code ", code)
+                    end
+                    handleHttpReqs()
+                end,
+                function(err)
+                    httpInFlight = math.max(0, httpInFlight - 1)
+                    print("DECTalk HTTP ERROR: ", err)
+                    handleHttpReqs()
+                end
+            )
+        end
+
+        local function parseText(text)
+            local samples = {}
+            for k, v in ipairs(aliasList) do
+                local pos
+                repeat
+                    pos = string.find(string.lower(text), string.lower(v), 0, true)
+                    if pos then
+                        text = string.sub(text, 0, pos - 1) .. string.rep(" ", #v) .. string.sub(text, pos + #v)
+                        table.insert(samples, {
+                            str = v,
+                            pos = pos
+                        })
+                    end
+                until not pos
+            end
+            
+            table.sort(samples, function(a, b) return a.pos < b.pos end)
+            
+            local textLen = #text
+            local list = {}
+            for k, v in ipairs(samples) do
+                local before = string.trim(string.sub(text, 0, v.pos - 1 - (textLen - #text)))
+                
+                if #before > 0 then
+                    table.insert(list, {
+                        type = "voice",
+                        hash = generateVoiceHash(before),
+                        text = before
+                    })
+                end
+                table.insert(list, {
+                    type = "sample",
+                    name = aliasLookup[v.str]
+                })
+                
+                text = string.sub(text, v.pos - (textLen - #text) + #v.str)
+            end
+            
+            local last = string.trim(text)
+            if #last > 0 then
+                table.insert(list, {
+                    type = "voice",
+                    hash = generateVoiceHash(last),
+                    text = last
+                })
+            end
+            
+            return list
+        end
+        
+        local function tts(text)
+            local parsed = parseText(text)
+            
+            local queueFull = false
+            for k, v in pairs(parsed) do
+                if v.type == "voice" and not file.existsTemp(SIGNATURE .. "_" .. v.hash .. ".mp3") then
+                    local queued = false
+                    for _, queuedItem in pairs(httpQueue) do
+                        if queuedItem.hash == v.hash then queued = true break end
+                    end
+                    if not queued then
+                        if #httpQueue < MAX_HTTP_QUEUE then
+                            table.insert(httpQueue, v)
+                        else
+                            queueFull = true
+                        end
+                    end
+                end
+                parsed[k] = v.name or v.hash
+            end
+
+            if queueFull then
+                print("DECTalk queue full; dropping this speech message")
+                return
+            end
+
+            handleHttpReqs()
+            local data = bit.compress(bit.tableToString(parsed))
+            
+            net.start("tts")
+                net.writeData(data, #data)
+            net.send(nil, false)
+        end
+        
+        local function sendSetting(setting)
+            net.start("settings")
+                net.writeString(setting)
+            net.send(nil, false)
+        end
+
+        -- The selected tag is added before every ordinary chat message.
+        -- The tags are passed through to the configured DECTalk TTS endpoint.
+        local ACTIVE_VOICE_TAG = "[:np]"
+        local VOICE_COMMANDS = {
+            teen = { tag = "[:nb]", name = "Teenager" },
+            man = { tag = "[:nh]", name = "Deep male" },
+            kid = { tag = "[:nk]", name = "Young child" },
+            breath = { tag = "[:nf]", name = "Breathy voice" },
+            normal = { tag = "[:np]", name = "Standard voice" },
+            soft = { tag = "[:nd]", name = "Soft quiet male" },
+            hl1 = { tag = "[:dv ap 10]", name = "Half-Life 1 announcer" },
+            robot = { tag = "[:dv pr 1]", name = "Monotone" }
+        }
+
+        local function showVoiceHelp()
+            print("[SFX TTS] VOICE COMMANDS:")
+            print("!teen = Teenager | !man = Deep male | !kid = Child")
+            print("!kid = Child | !breath = Breathy | !normal = Standard | !soft = Soft male")
+            print("!hl1 = Half-Life 1 announcer | !robot = Monotone")
+            print("Use a command alone to select a voice, or add text: !man Hello there!")
+            print("!voices / !ttshelp = show this list | !voicedemo = speak voice demo")
+            print("Other: !vol 0-10 | !pitch 0.5-2 | !shaky on/off")
+        end
+
+        local function handleChatCommand(text)
+            -- Use plain string operations; preserve the original message casing.
+            local commandText = string.trim(text)
+            if string.sub(commandText, 1, 1) != "!" then return false end
+
+            local body = string.sub(commandText, 2)
+            local splitAt = string.find(body, " ", 1, true)
+            local command, value
+
+            if splitAt then
+                command = string.lower(string.sub(body, 1, splitAt - 1))
+                value = string.trim(string.sub(body, splitAt + 1))
+            else
+                command = string.lower(body)
+                value = ""
+            end
+
+            if command == "" then return false end
+
+            local selectedVoice = VOICE_COMMANDS[command]
+            if selectedVoice then
+                ACTIVE_VOICE_TAG = selectedVoice.tag
+                print("TTS voice: " .. selectedVoice.name .. " (" .. selectedVoice.tag .. ")")
+                -- Optional one-shot speech: !man Hello there!
+                if #value > 0 then
+                    tts(ACTIVE_VOICE_TAG .. value)
+                end
+                return true
+            elseif command == "voices" or command == "ttshelp" or command == "voicehelp" then
+                showVoiceHelp()
+                return true
+            elseif command == "voicedemo" then
+                tts("[:nb]Teenager voice. [:nh]Deep male voice. " ..
+                    "[:nk]Young child voice. [:nf]Breathy voice. [:np]Standard voice. " ..
+                    "[:nd]Soft quiet male voice. [:dv ap 10]Half Life one announcer. " ..
+                    "[:dv pr 1]Monotone voice.")
+                return true
+            elseif command == "vol" then
+                local number = tonumber(value)
+                if not number then
+                    print("Usage: !vol 0-10")
+                else
+                    number = math.max(0, math.min(10, number))
+                    sendSetting("vol|" .. number)
+                    print("TTS volume set to " .. number)
+                end
+                return true
+            elseif command == "pitch" then
+                local number = tonumber(value)
+                if not number then
+                    print("Usage: !pitch 0.5-2 (1 = normal)")
+                else
+                    number = math.max(0.5, math.min(2, number))
+                    sendSetting("pitch|" .. number)
+                    print("TTS pitch set to " .. number)
+                end
+                return true
+            elseif command == "shaky" then
+                local mode = string.lower(value)
+                if mode == "on" then
+                    sendSetting("shaky|1")
+                    print("TTS shaky voice enabled")
+                elseif mode == "off" then
+                    sendSetting("shaky|0")
+                    print("TTS shaky voice disabled")
+                else
+                    print("Usage: !shaky on or !shaky off")
+                end
+                return true
+            end
+            return false
+        end
+
+        net.receive("say", function()
+            local text = net.readString()
+            if not handleChatCommand(text) then
+                tts(ACTIVE_VOICE_TAG .. text)
+            end
+        end)
+
+        -- Show the command list in the owner's chat on startup. Do not speak it.
+        timer.simple(3, function()
+            showVoiceHelp()
+        end)
+
+        net.receive("request", function(len)
+            len = math.ceil(len / 8)
+            local data = bit.decompress(net.readData(len))
+            
+            if file.exists(DIR .. "/samples/" .. data .. ".mp3") or file.existsTemp(SIGNATURE .. "_" .. data .. ".mp3") then
+                table.insert(streamQueue, data)
+                handleStreams()
+            else
+                table.insert(fileRequests, data)
+            end
+        end)
+        
+        net.receive("ready", function()
+            canStream = true
+        end)
+    else
+        local lastFileName
+    
+        net.receive("fileInfo", function(len)
+            len = math.ceil(len / 8)
+            lastFileName = bit.decompress(net.readData(len))
+        end)
+        
+        net.receive("fileData", function()
+            net.readStream(function(stream)
+                file.writeTemp(SIGNATURE .. "_" .. lastFileName .. ".mp3", stream)
+                
+                net.start("ready")
+                net.send(nil, false)
+            end)
+        end)
+        
+        net.start("ready")
+        net.send(nil, false)
+    end
+
+    -- Every client receives the owner's live playback settings.
+    net.receive("settings", function()
+        local setting = net.readString()
+        local kind, value = string.match(setting, "^(%w+)|(.+)$")
+        value = tonumber(value)
+        if kind == "vol" and value then
+            VOLUME = math.max(0, math.min(10, value))
+        elseif kind == "pitch" and value then
+            PITCH = math.max(0.5, math.min(2, value))
+        elseif kind == "shaky" and value then
+            SHAKY_VOICE = value == 1
+        end
+    end)
+    
+    timer.create("handleQueues", 0, 0, function()
+        if player() == owner() then
+            handleStreams()
+            handleHttpReqs()
+        end
+        handleTTS()
+    end)
+    
+    net.receive("tts", function(len)
+        len = math.ceil(len / 8)
+        local data = bit.stringToTable(bit.decompress(net.readData(len)))
+        
+        if #ttsQueue >= MAX_TTS_QUEUE then return end
+        table.insert(ttsQueue, data)
+        handleTTS()
+        
+        if player() != owner() then
+            local missingList = listMissingAudio(data)
+            
+            if #missingList > 0 then
+                local missingData = bit.compress(bit.tableToString(missingList))
+                    
+                net.start("request")
+                    net.writeData(missingData, #missingData)
+                net.send(nil, false)
+            end
+        end
+    end)
+end
