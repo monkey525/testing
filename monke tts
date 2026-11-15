@@ -1,0 +1,932 @@
+--@name monke tts v6
+--@author Bonyoze + monke
+--@shared
+
+-- v1.3.1 + editable URL sound triggers and per-sound volume
+--
+-- EASY SETTINGS:
+-- TTS_MODE: 0 = silent, 1 = DECTalk speech + samples, 2 = samples only.
+-- Add or change trigger words, MP3 URLs, and per-sound volume in CUSTOM_SOUNDS.
+-- Each custom sound's volume is set from 0 (mute) to 10 (full volume).
+-- Example: typing "are you good bruh?" speaks "are you good", then plays bruh.
+-- The playback queue also performs a soft audio reset after each chat sentence;
+-- this does not reload the chip or interrupt permission/settings state.
+local HIDE_CHAT = false -- true/false
+local TTS_MODE = 1
+local MAX_CHAT_CHARS = 240
+local MAX_TTS_QUEUE = 8
+local MAX_BASS_QUEUE = 12
+local MAX_HTTP_QUEUE = 40
+local MAX_HTTP_CONCURRENT = 1
+local VOLUME = 5 -- DECTalk and saved-sample volume, 0-10
+local PITCH = 1 -- DECTalk and saved-sample pitch, 0.5-2 (1 = normal)
+local CUSTOM_SOUND_PITCH = 1 -- direct-URL sound pitch, 0.25-3
+local CUSTOM_SOUNDS = {
+    bruh = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/Bruh%20sound%20effect.mp3", volume = 2 },
+    ["fuck you"] = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/f-you-postal-dude.mp3", volume = 2 },
+    heh = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/bender%20laugh2.mp3", volume = 2 },
+    laugh = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/cat%20luagh.mp3", volume = 1 },
+    rizz = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/rizz%20sound.mp3", volume = 2 },
+    [":("] = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/boo-womp%20-%20normal.mp3", volume = 2 },
+    [":)"] = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/happy.mp3", volume = 2 },
+    ayo = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/Aye%20Yo%20WTF.mp3", volume = 2 },
+    huh = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/huh%20short.mp3", volume = 2 },
+    scream = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/meme%20scream.mp3", volume = 2 },
+    petah = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/petah.mp3", volume = 2 },
+    shit = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/shit.mp3", volume = 2 },
+    howdy = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/howdy%20short.mp3", volume = 2 },
+    boo = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/ooga%20booga%20sr%20pelo.mp3", volume = 2 },
+    nope = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/%27%27Nope%21%27%27%20%28Engineer%20Voice%20Lines%29.mp3", volume = 2 },
+    horse = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/horse.mp3", volume = 2 },
+    A = { url = "https://raw.githubusercontent.com/monkey525/test-2/main/A%20death.mp3", volume = 2 },
+}
+local CASE_SENSITIVE_SOUND_TRIGGERS = { A = true } -- Lowercase "a" will not trigger this sound.
+local URL_SAMPLE_PREFIX = "URL:"
+
+-- probably shouldn't modify these
+local DIR = "sfx_tts" -- directory for the script (relative to data/sf_filedata)
+local SIGNATURE = "garry" -- unique string prepended to the temp file name (can be anything)
+local BASS_MAX = 20 -- max amount of bass objects at once before they queue (20 is the default for sf_bass_max_cl)
+
+if SERVER then
+    local audioCache = {}
+    
+    local streamQueue, awaitingReqs, requests = {}, {}, {}
+
+    -- Starfall limits the number of active writeStreams. Keep one global
+    -- server-to-client transfer active and wait for every recipient to ACK it.
+    local sendingFile = false
+    local pendingFileAcks = {}
+
+    function handleFileSending()
+        if sendingFile then return end
+
+        for name, waitingPlayers in pairs(awaitingReqs) do
+            local cached = audioCache[name]
+            if not cached then continue end
+
+            local clients = {}
+            for i = #waitingPlayers, 1, -1 do
+                local ply = waitingPlayers[i]
+                if not ply:isValid() then
+                    table.remove(waitingPlayers, i)
+                elseif ply.ready then
+                    table.insert(clients, ply)
+                    table.remove(waitingPlayers, i)
+                    ply.ready = false
+                end
+            end
+
+            if #clients > 0 then
+                sendingFile = true
+                pendingFileAcks = {}
+                for _, ply in ipairs(clients) do
+                    pendingFileAcks[ply] = true
+                end
+
+                local fileInfo = bit.compress(name)
+                net.start("fileInfo")
+                    net.writeData(fileInfo, #fileInfo)
+                net.send(clients, false)
+
+                net.start("fileData")
+                    net.writeStream(cached)
+                net.send(clients, false)
+                return -- never start a second writeStream in this call
+            end
+        end
+    end
+    
+    hook.add("PlayerSay", "", function(ply, text)
+        if ply == owner() then
+            text = string.trim(text)
+            if #text == 0 then return end
+            -- Commands are handled by the owner's client; ordinary chat is spoken.
+            if #text > MAX_CHAT_CHARS and string.sub(text, 1, 1) != "!" then
+                text = string.sub(text, 1, MAX_CHAT_CHARS)
+            end
+            net.start("say")
+                net.writeString(text)
+            net.send(owner(), false)
+            if HIDE_CHAT then return "" end
+        end
+    end)
+
+    -- Only the owner may change playback settings; relay them to every client.
+    net.receive("settings", function(_, ply)
+        if ply != owner() then return end
+        local setting = net.readString()
+        net.start("settings")
+            net.writeString(setting)
+        net.send(find.allPlayers(), false)
+    end)
+    
+    net.receive("tts", function(len)
+        len = math.ceil(len / 8)
+        net.start("tts")
+            net.writeData(net.readData(len), len)
+        net.send(find.allPlayers(), false)
+    end)
+    
+    net.receive("request", function(len, ply)
+        len = math.ceil(len / 8)
+        local data = net.readData(len)
+        
+        local tbl = bit.stringToTable(bit.decompress(data))
+        
+        for k, v in pairs(tbl) do
+            if not awaitingReqs[v] and not requests[v] then
+                requests[v] = true
+            end
+                
+            if not awaitingReqs[v] then
+                awaitingReqs[v] = {}
+            end
+            table.insert(awaitingReqs[v], ply)
+        end
+    end)
+    
+    local lastFileName
+    
+    net.receive("fileInfo", function(len)
+        len = math.ceil(len / 8)
+        lastFileName = bit.decompress(net.readData(len))
+    end)
+    
+    net.receive("fileData", function(len)
+        len = math.ceil(len / 8)
+        net.readStream(function(stream)
+            audioCache[lastFileName] = stream
+            
+            handleFileSending()
+            
+            net.start("ready")
+            net.send(owner(), false)
+        end)
+    end)
+    
+    net.receive("ready", function(_, ply)
+        ply.ready = true
+
+        if pendingFileAcks[ply] then
+            pendingFileAcks[ply] = nil
+
+            if not next(pendingFileAcks) then
+                sendingFile = false
+                handleFileSending()
+            end
+        end
+    end)
+    
+    timer.create("handleReqs", 0, 0, function()
+        local reqs = table.getKeys(requests)
+        if #reqs == 0 then return end
+        
+        local req = reqs[1]
+        if audioCache[req] then
+            handleFileSending()
+        else
+            local data = bit.compress(req)
+            
+            net.start("request")
+                net.writeData(data, #data)
+            net.send(owner(), false)
+        end
+        
+        requests[req] = nil
+    end)
+    
+    timer.create("handleFileSending", 0, 0, handleFileSending)
+    
+    net.receive("test", function(len, ply)
+        print(ply, net.readString())
+    end)
+else
+    local ttsQueue, bassQueue = {}, {}
+    local playbackBusy = false
+    local pendingURLItem = nil
+    local activeSound = nil
+    local SENTENCE_END = {}
+
+    -- URL sounds use the same bass.loadURL permission flow as the MusicPlayer
+    -- example. Each client may need to press E once to allow the sound URL.
+    if next(CUSTOM_SOUNDS) then
+        setupPermissionRequest({"bass.loadURL"}, "TTS custom URL sounds", true)
+    end
+
+    -- A single playback worker owns the queue. This avoids competing async
+    -- bass.loadFile callbacks when another chat message arrives mid-playback.
+    local function playNextInQueue()
+        if playbackBusy or pendingURLItem or #bassQueue == 0 then return end
+
+        playbackBusy = true
+        local item = table.remove(bassQueue, 1)
+        if item == SENTENCE_END then
+            -- Soft-reset audio state at the end of each chat sentence without
+            -- reloading the chip or losing its permissions and settings.
+            if activeSound and isValid(activeSound) then
+                activeSound:stop()
+            end
+            activeSound = nil
+            playbackBusy = false
+            timer.simple(0, playNextInQueue)
+            return
+        end
+
+        local isURLSound = string.sub(item, 1, #URL_SAMPLE_PREFIX) == URL_SAMPLE_PREFIX
+        local customURL, customVolume
+        if isURLSound then
+            local encodedSound = string.sub(item, #URL_SAMPLE_PREFIX + 1)
+            local encodedVolume, encodedURL = string.match(encodedSound, "^([^|]+)|(.*)$")
+            customURL = encodedURL or encodedSound
+            customVolume = math.max(0, math.min(10, tonumber(encodedVolume) or 5))
+        end
+        local appliedPitch
+        if isURLSound then
+            appliedPitch = math.max(0.25, math.min(3, CUSTOM_SOUND_PITCH))
+        else
+            appliedPitch = math.max(0.25, math.min(3, PITCH))
+        end
+
+        local function handleBass(snd, err, msg)
+            if not snd then
+                print("BASS ERROR: ", err, msg)
+                activeSound = nil
+                playbackBusy = false
+                timer.simple(0, playNextInQueue)
+                return
+            end
+
+            activeSound = snd
+            if not owner():isValid() then
+                if isValid(snd) then snd:stop() end
+                activeSound = nil
+                playbackBusy = false
+                timer.simple(0, playNextInQueue)
+                return
+            end
+
+            snd:setPos(owner():getPos())
+            if isURLSound then
+                snd:setVolume(customVolume)
+            else
+                snd:setVolume(VOLUME)
+            end
+
+            snd:setPitch(appliedPitch)
+            -- bass.loadURL starts playback on load; cached files need :play().
+            if not isURLSound then snd:play() end
+
+            -- Some streamed BASS objects report no length yet. Don't let a nil
+            -- length error strand playbackBusy and block all later speech.
+            local length
+            local lengthOK, reportedLength = pcall(snd.getLength, snd)
+            if lengthOK then length = tonumber(reportedLength) end
+            local duration = 0.1
+            if length and length > 0 then
+                duration = length / appliedPitch
+            end
+
+            timer.simple(duration, function()
+                if isValid(snd) then snd:stop() end
+                if activeSound == snd then activeSound = nil end
+                playbackBusy = false
+                playNextInQueue()
+            end)
+        end
+
+        if isURLSound then
+            if not hasPermission("bass.loadURL", customURL) then
+                pendingURLItem = item
+                playbackBusy = false
+                print("Press E to grant URL sound permission")
+                return
+            end
+            bass.loadURL(customURL, "3d noblock", handleBass)
+        else
+            local filePath
+            if player() == owner() and file.exists(DIR .. "/samples/" .. item .. ".mp3") then
+                filePath = "data/sf_filedata/" .. DIR .. "/samples/" .. item .. ".mp3"
+            else
+                filePath = file.existsTemp(SIGNATURE .. "_" .. item .. ".mp3")
+            end
+            bass.loadFile(filePath, "3d", handleBass)
+        end
+    end
+
+    hook.add("permissionrequest", "tts_url_permission_retry", function()
+        if not pendingURLItem then return end
+        local customURL = string.sub(pendingURLItem, #URL_SAMPLE_PREFIX + 1)
+        if hasPermission("bass.loadURL", customURL) then
+            local item = pendingURLItem
+            pendingURLItem = nil
+            table.insert(bassQueue, 1, item)
+            playNextInQueue()
+        end
+    end)
+
+    local function listMissingAudio(data)
+        local hash = {}
+            
+        for k, v in pairs(data) do
+            local isURLSound = string.sub(v, 1, #URL_SAMPLE_PREFIX) == URL_SAMPLE_PREFIX
+            if not isURLSound and not hash[v] and not (player() == owner() and file.exists(DIR .. "/samples/" .. v .. ".mp3")) and not file.existsTemp(SIGNATURE .. "_" .. v .. ".mp3") then
+                hash[v] = true
+            end
+        end
+        
+        return table.getKeys(hash)
+    end
+    
+    local function handleTTS()
+        if #ttsQueue == 0 then return end
+            
+        local item = ttsQueue[1]
+        
+        if #listMissingAudio(item) != 0 then return end
+        
+        -- A TTS message is an ordered list of audio hashes/sample names.
+        -- Keep entries flat, then add a local sentence-end reset marker.
+        for _, audioName in ipairs(item) do
+            if #bassQueue < MAX_BASS_QUEUE then
+                table.insert(bassQueue, audioName)
+            else
+                print("TTS playback queue full; dropping remaining audio")
+                break
+            end
+        end
+        table.insert(bassQueue, SENTENCE_END)
+
+        table.remove(ttsQueue, 1)
+        playNextInQueue()
+    end
+
+    if player() == owner() then
+        -- On-screen notifications for volume and pitch changes.
+        -- These replace the old chat/console print messages.
+        local settingNotice = ""
+        local settingNoticeUntil = 0
+
+        local function showSettingNotice(message)
+            settingNotice = tostring(message or "")
+            settingNoticeUntil = timer.curtime() + 3
+        end
+
+        -- StarfallEx HUD drawing. This chip must have the HUD permissions
+        -- enabled by the server (enablehud and render.hud).
+        local noticeFont = render.createFont("Arial", 18, 700, true, false, false, false, false, false)
+        enableHud(nil, true)
+
+        hook.add("drawhud", "tts_setting_notice", function()
+            if settingNotice == "" then return end
+            if timer.curtime() > settingNoticeUntil then
+                settingNotice = ""
+                return
+            end
+
+            local x, y, w, h = 20, 100, 300, 44
+            render.setColor(Color(0, 0, 0, 220))
+            render.drawRectFast(x, y, w, h)
+
+            render.setFont(noticeFont)
+            render.setColor(Color(255, 255, 255, 255))
+            render.drawText(x + 12, y + 12, settingNotice, 0)
+        end)
+
+        file.createDir(DIR)
+        file.createDir(DIR .. "/samples")
+        if not file.exists(DIR .. "/aliases.json") then file.write(DIR .. "/aliases.json", json.encode({}, true)) end
+        
+        local aliasData = json.decode(file.read(DIR .. "/aliases.json") or "{}") or {}
+        local aliasList, aliasLookup = {}, {}
+        
+        for k, v in pairs(aliasData) do -- reformat alias data
+            if type(v) == "table" then
+                for _, vv in ipairs(v) do
+                    local alias = "" .. vv
+                    if #alias > 0 then
+                        table.insert(aliasList, alias)
+                        aliasLookup[string.lower(alias)] = "" .. k
+                    end
+                end
+            end
+        end
+
+        -- Add direct URL sounds to the same phrase matcher used by saved samples.
+        -- A custom URL sound takes priority if its trigger also exists in aliases.json.
+        for trigger, soundConfig in pairs(CUSTOM_SOUNDS) do
+            trigger = string.trim(tostring(trigger or ""))
+            local soundURL = type(soundConfig) == "table" and soundConfig.url or soundConfig
+            local soundVolume = type(soundConfig) == "table" and tonumber(soundConfig.volume) or 5
+            soundURL = string.trim(tostring(soundURL or ""))
+            soundVolume = math.max(0, math.min(10, tonumber(soundVolume) or 5))
+            if #trigger > 0 and #soundURL > 0 then
+                table.insert(aliasList, trigger)
+                aliasLookup[string.lower(trigger)] = URL_SAMPLE_PREFIX .. tostring(soundVolume) .. "|" .. soundURL
+            end
+        end
+        
+        table.sort(aliasList, function(a, b) return #a > #b end)
+        
+        local canStream = true
+        local httpQueue, streamQueue, fileRequests = {}, {}, {}
+        
+        local function generateVoiceHash(text)
+            return bit.sha256(text .. "dectalk")
+        end
+
+        local dectalkURL = "https://tts.cyzon.us/tts"
+
+        local function buildVoiceURL(text)
+            return dectalkURL .. "?text=" .. http.urlEncode(text)
+        end
+
+        function handleStreams()
+            if #streamQueue == 0 or not canStream then return end
+            
+            local name = streamQueue[1]
+            
+            local fileInfo, fileData = bit.compress(name), file.read(DIR .. "/samples/" .. name .. ".mp3") or file.readTemp(SIGNATURE .. "_" .. name .. ".mp3")
+            
+            net.start("fileInfo")
+                net.writeData(fileInfo, #fileInfo)
+            net.send(nil, false)
+            
+            net.start("fileData")
+                net.writeStream(fileData)
+            net.send(nil, false)
+            
+            table.remove(streamQueue, 1)
+            canStream = false
+        end
+        
+        local function checkFileReq(name)
+            for k, v in pairs(fileRequests) do
+                if v == name then
+                    table.insert(streamQueue, v)
+                    table.remove(fileRequests, k)
+                    handleStreams()
+                    return
+                end
+            end
+        end
+        
+        local httpInFlight = 0
+
+        function handleHttpReqs()
+            if #httpQueue == 0 or httpInFlight >= MAX_HTTP_CONCURRENT or not http.canRequest() then return end
+            local item = table.remove(httpQueue, 1)
+            httpInFlight = httpInFlight + 1
+            http.get(buildVoiceURL(item.text),
+                function(body, _, _, code)
+                    httpInFlight = math.max(0, httpInFlight - 1)
+                    if code == 200 and body and #body > 0 then
+                        file.writeTemp(SIGNATURE .. "_" .. item.hash .. ".mp3", body)
+                        checkFileReq(item.hash)
+                        -- Space requests out: word-by-word mode can create many
+                        -- separate DECTalk requests and the service rate-limits bursts.
+                        timer.simple(1.25, handleHttpReqs)
+                    elseif code == 429 then
+                        -- Put the failed word back and pause before retrying.
+                        table.insert(httpQueue, 1, item)
+                        print("DECTalk is rate-limiting requests (429); retrying in 6 seconds")
+                        timer.simple(6, handleHttpReqs)
+                    else
+                        print("DECTalk HTTP ERROR: received code ", code)
+                        timer.simple(1.25, handleHttpReqs)
+                    end
+                end,
+                function(err)
+                    httpInFlight = math.max(0, httpInFlight - 1)
+                    print("DECTalk HTTP ERROR: ", err)
+                    -- A transient transport error should not permanently lose the word.
+                    table.insert(httpQueue, 1, item)
+                    timer.simple(3, handleHttpReqs)
+                end
+            )
+        end
+
+        local function isWordCharacter(character)
+            if not character or character == "" then return false end
+            return string.find(character, "[%w_]") ~= nil
+        end
+
+        local function parseText(text)
+            local list = {}
+            local lowerText = string.lower(text)
+            local cursor = 1
+
+            while cursor <= #text do
+                local bestStart, bestAlias = nil, nil
+
+                -- Find the next whole-word alias, preferring the longest match
+                -- when two aliases begin at the same position.
+                for _, alias in ipairs(aliasList) do
+                    local caseSensitiveTrigger = nil
+                    for trigger in pairs(CASE_SENSITIVE_SOUND_TRIGGERS) do
+                        if string.lower(trigger) == string.lower(alias) then
+                            caseSensitiveTrigger = trigger
+                            break
+                        end
+                    end
+
+                    -- Ignore case-insensitive aliases that collide with a
+                    -- case-sensitive sound, so lowercase "a" stays ordinary speech.
+                    if not caseSensitiveTrigger or alias == caseSensitiveTrigger then
+                        local matchText = caseSensitiveTrigger and text or lowerText
+                        local matchAlias = caseSensitiveTrigger and caseSensitiveTrigger or string.lower(alias)
+                        local searchFrom = cursor
+                        local pos = string.find(matchText, matchAlias, searchFrom, true)
+
+                        while pos do
+                            local afterPos = pos + #matchAlias
+                            local beforeChar, afterChar
+                            if pos > 1 then beforeChar = string.sub(text, pos - 1, pos - 1) end
+                            if afterPos <= #text then
+                                afterChar = string.sub(text, afterPos, afterPos)
+                            end
+
+                            local isEmoticonTrigger = alias == ":(" or alias == ":)"
+                            if (isEmoticonTrigger or not isWordCharacter(beforeChar)) and
+                                (isEmoticonTrigger or not isWordCharacter(afterChar)) then
+                                if not bestStart or pos < bestStart or (pos == bestStart and #matchAlias > #bestAlias) then
+                                    bestStart = pos
+                                    bestAlias = alias
+                                end
+                                break
+                            end
+
+                            searchFrom = pos + 1
+                            pos = string.find(matchText, matchAlias, searchFrom, true)
+                        end
+                    end
+                end
+
+                if not bestStart then break end
+
+                local before = string.trim(string.sub(text, cursor, bestStart - 1))
+                if #before > 0 then
+                    table.insert(list, {
+                        type = "voice",
+                        hash = generateVoiceHash(before),
+                        text = before
+                    })
+                end
+
+                local sampleName = aliasLookup[string.lower(bestAlias)]
+                table.insert(list, {
+                    type = "sample",
+                    name = sampleName
+                })
+
+                cursor = bestStart + #bestAlias
+                local isURLSound = sampleName and string.sub(sampleName, 1, #URL_SAMPLE_PREFIX) == URL_SAMPLE_PREFIX
+                if isURLSound then
+                    -- Don't send punctuation attached to a sound trigger to TTS.
+                    while cursor <= #text and string.find(",.!?;:", string.sub(text, cursor, cursor), 1, true) do
+                        cursor = cursor + 1
+                    end
+                end
+            end
+
+            local last = string.trim(string.sub(text, cursor))
+            if #last > 0 then
+                table.insert(list, {
+                    type = "voice",
+                    hash = generateVoiceHash(last),
+                    text = last
+                })
+            end
+
+            return list
+        end
+        
+        -- Remove chat formatting tags such as <color=255,0,0> and </color>
+        -- from the spoken copy only. The original chat message is unchanged.
+        local function stripChatFormatting(text)
+            -- Starfall may pass non-string values through callbacks; normalize first.
+            local source = tostring(text or "")
+            -- Capture only gsub's first return value (the replaced string).
+            local cleaned = string.gsub(source, "<[^>]*>", "")
+            return string.trim(cleaned)
+        end
+
+        local function tts(text, voiceTag)
+            text = stripChatFormatting(text)
+            if #text == 0 then return end
+            if TTS_MODE == 0 then return end
+
+            local parsed = parseText(text)
+            -- A sound splits one sentence into separate DECTalk requests.
+            -- Reapply the selected voice to every spoken segment after splitting.
+            if voiceTag and voiceTag ~= "" then
+                for _, v in ipairs(parsed) do
+                    if v.type == "voice" then
+                        v.text = voiceTag .. v.text
+                        v.hash = generateVoiceHash(v.text)
+                    end
+                end
+            end
+
+            local audioItems = {}
+            local queueFull = false
+            for _, v in ipairs(parsed) do
+                if v.type == "voice" then
+                    if TTS_MODE == 1 then
+                        if not file.existsTemp(SIGNATURE .. "_" .. v.hash .. ".mp3") then
+                            local queued = false
+                            for _, queuedItem in pairs(httpQueue) do
+                                if queuedItem.hash == v.hash then queued = true break end
+                            end
+                            if not queued then
+                                if #httpQueue < MAX_HTTP_QUEUE then
+                                    table.insert(httpQueue, v)
+                                else
+                                    queueFull = true
+                                end
+                            end
+                        end
+                        table.insert(audioItems, v.hash)
+                    end
+                else
+                    table.insert(audioItems, v.name)
+                end
+            end
+
+            if queueFull then
+                print("DECTalk queue full; dropping this speech message")
+                return
+            end
+            if #audioItems == 0 then return end
+
+            handleHttpReqs()
+            local data = bit.compress(bit.tableToString(audioItems))
+            
+            net.start("tts")
+                net.writeData(data, #data)
+            net.send(nil, false)
+        end
+        
+        local function sendSetting(setting)
+            net.start("settings")
+                net.writeString(setting)
+            net.send(nil, false)
+        end
+
+        -- The selected voice is applied to every spoken chunk, including text
+        -- on either side of a custom sound.
+        -- The selected voice is saved locally so it survives Starfall reloads/crashes.
+        local VOICE_FILE = DIR .. "/voice.txt"
+        local PITCH_FILE = DIR .. "/pitch.txt"
+        local VOLUME_FILE = DIR .. "/volume.txt"
+        local ACTIVE_VOICE_TAG = "[:np]"
+        local ACTIVE_ADJUSTMENT = "pitch" -- left arrow = pitch, right arrow = volume
+        local VOICE_COMMANDS = {
+            teen = { tag = "[:nb]", name = "Teenager" },
+            man = { tag = "[:nh]", name = "Deep male" },
+            kid = { tag = "[:nk]", name = "Young child" },
+            breath = { tag = "[:nf]", name = "Breathy voice" },
+            normal = { tag = "[:np]", name = "Standard voice" },
+            soft = { tag = "[:nd]", name = "Soft quiet male" },
+            hl1 = { tag = "[:dv ap 10]", name = "Half-Life 1 announcer" },
+            robot = { tag = "[:dv pr 1]", name = "Monotone" }
+        }
+
+        -- Restore the last selected voice. Fall back to Standard if the file
+        -- is missing or contains an invalid voice name.
+        local savedVoice = string.trim(file.read(VOICE_FILE) or "")
+        if VOICE_COMMANDS[savedVoice] then
+            ACTIVE_VOICE_TAG = VOICE_COMMANDS[savedVoice].tag
+            print("TTS voice restored: " .. VOICE_COMMANDS[savedVoice].name)
+        else
+            file.write(VOICE_FILE, "normal")
+            print("TTS voice defaulted to Standard")
+        end
+
+        -- Restore the last selected pitch after a Starfall reload/crash.
+        local savedPitch = tonumber(string.trim(file.read(PITCH_FILE) or ""))
+        if savedPitch then
+            PITCH = math.max(0.5, math.min(2, savedPitch))
+            showSettingNotice("Pitch restored: " .. PITCH)
+        else
+            PITCH = 1
+            file.write(PITCH_FILE, "1")
+            showSettingNotice("Pitch defaulted to 1")
+        end
+
+        -- Restore the owner's volume setting as well.
+        local savedVolume = tonumber(string.trim(file.read(VOLUME_FILE) or ""))
+        if savedVolume then
+            VOLUME = math.max(0, math.min(10, savedVolume))
+            showSettingNotice("Volume restored: " .. VOLUME)
+        else
+            VOLUME = 5
+            file.write(VOLUME_FILE, "5")
+            showSettingNotice("Volume defaulted to 5")
+        end
+
+        -- Keyboard controls are handled only on the owner's client.
+        -- Left selects pitch, right selects volume; up/down adjust the selected value.
+        hook.add("inputpressed", "tts_keyboard_settings", function(key)
+            if key == KEY.LEFT then
+                ACTIVE_ADJUSTMENT = "pitch"
+                showSettingNotice("Adjusting PITCH (Up/Down)")
+            elseif key == KEY.RIGHT then
+                ACTIVE_ADJUSTMENT = "volume"
+                showSettingNotice("Adjusting VOLUME (Up/Down)")
+            elseif key == KEY.UP then
+                if ACTIVE_ADJUSTMENT == "pitch" then
+                    PITCH = math.min(2, math.floor((PITCH + 0.050001) * 100 + 0.5) / 100)
+                    file.write(PITCH_FILE, tostring(PITCH))
+                    sendSetting("pitch|" .. PITCH)
+                    showSettingNotice("Pitch: " .. PITCH)
+                else
+                    VOLUME = math.min(10, math.floor((VOLUME + 0.500001) * 2 + 0.5) / 2)
+                    file.write(VOLUME_FILE, tostring(VOLUME))
+                    sendSetting("vol|" .. VOLUME)
+                    showSettingNotice("Volume: " .. VOLUME)
+                end
+            elseif key == KEY.DOWN then
+                if ACTIVE_ADJUSTMENT == "pitch" then
+                    PITCH = math.max(0.5, math.floor((PITCH - 0.050001) * 100 + 0.5) / 100)
+                    file.write(PITCH_FILE, tostring(PITCH))
+                    sendSetting("pitch|" .. PITCH)
+                    showSettingNotice("Pitch: " .. PITCH)
+                else
+                    VOLUME = math.max(0, math.floor((VOLUME - 0.500001) * 2 + 0.5) / 2)
+                    file.write(VOLUME_FILE, tostring(VOLUME))
+                    sendSetting("vol|" .. VOLUME)
+                    showSettingNotice("Volume: " .. VOLUME)
+                end
+            end
+        end)
+
+        local function showVoiceHelp()
+            print("[SFX TTS] VOICE COMMANDS:")
+            print("!teen = Teenager | !man = Deep male | !kid = Child")
+            print("!kid = Child | !breath = Breathy | !normal = Standard | !soft = Soft male")
+            print("!hl1 = Half-Life 1 announcer | !robot = Monotone")
+            print("Use a command alone to select a voice, or add text: !man Hello there!")
+            print("!ttshelp = show this list | !voicedemo = speak voice demo")
+            print("Other: !vol 0-10 | !pitch 0.5-2")
+            print("Top settings: TTS_MODE 0=off, 1=voice+sounds, 2=sounds only")
+            print("Edit CUSTOM_SOUNDS near the top to set triggers, MP3 URLs, and each sound's volume (0-10)")
+            print("Sound triggers: bruh, f you, heh, rizz, :(, :), ayo, huh, scream, petah, shi")
+            print("More sounds: howdy, boo, nope, horse; uppercase A only")
+            print("Keyboard: Left = pitch | Right = volume | Up/Down = adjust selected setting")
+        end
+
+        local function handleChatCommand(text)
+            -- Use plain string operations; preserve the original message casing.
+            local commandText = string.trim(text)
+            if string.sub(commandText, 1, 1) != "!" then return false end
+
+            local body = string.sub(commandText, 2)
+            local splitAt = string.find(body, " ", 1, true)
+            local command, value
+
+            if splitAt then
+                command = string.lower(string.sub(body, 1, splitAt - 1))
+                value = string.trim(string.sub(body, splitAt + 1))
+            else
+                command = string.lower(body)
+                value = ""
+            end
+
+            if command == "" then return false end
+
+            local selectedVoice = VOICE_COMMANDS[command]
+            if selectedVoice then
+                ACTIVE_VOICE_TAG = selectedVoice.tag
+                -- Save the voice immediately; it will be restored after a reload.
+                file.write(VOICE_FILE, command)
+                print("TTS voice: " .. selectedVoice.name .. " (saved)")
+                -- Optional one-shot speech: !man Hello there!
+                if #value > 0 then
+                    tts(value, ACTIVE_VOICE_TAG)
+                end
+                return true
+            elseif command == "ttshelp" or command == "voicehelp" then
+                showVoiceHelp()
+                return true
+            elseif command == "voicedemo" then
+                tts("[:nb]Teenager voice. [:nh]Deep male voice. " ..
+                    "[:nk]Young child voice. [:nf]Breathy voice. [:np]Standard voice. " ..
+                    "[:nd]Soft quiet male voice. [:dv ap 10]Half Life one announcer. " ..
+                    "[:dv pr 1]Monotone voice.")
+                return true
+            elseif command == "vol" then
+                local number = tonumber(value)
+                if not number then
+                    showSettingNotice("Usage: !vol 0-10")
+                else
+                    number = math.max(0, math.min(10, number))
+                    sendSetting("vol|" .. number)
+                    showSettingNotice("Volume set to " .. number)
+                end
+                return true
+            elseif command == "pitch" then
+                local number = tonumber(value)
+                if not number then
+                    showSettingNotice("Usage: !pitch 0.5-2 (1 = normal)")
+                else
+                    number = math.max(0.5, math.min(2, number))
+                    PITCH = number
+                    file.write(PITCH_FILE, tostring(number))
+                    sendSetting("pitch|" .. number)
+                    showSettingNotice("Pitch set to " .. number .. " (saved)")
+                end
+                return true
+            end
+            return false
+        end
+
+        net.receive("say", function()
+            local text = net.readString()
+            if not handleChatCommand(text) then
+                tts(text, ACTIVE_VOICE_TAG)
+            end
+        end)
+
+        -- Show the command list in the owner's chat on startup. Do not speak it.
+        timer.simple(3, function()
+            showVoiceHelp()
+        end)
+
+        net.receive("request", function(len)
+            len = math.ceil(len / 8)
+            local data = bit.decompress(net.readData(len))
+            
+            if file.exists(DIR .. "/samples/" .. data .. ".mp3") or file.existsTemp(SIGNATURE .. "_" .. data .. ".mp3") then
+                table.insert(streamQueue, data)
+                handleStreams()
+            else
+                table.insert(fileRequests, data)
+            end
+        end)
+        
+        net.receive("ready", function()
+            canStream = true
+        end)
+    else
+        local lastFileName
+    
+        net.receive("fileInfo", function(len)
+            len = math.ceil(len / 8)
+            lastFileName = bit.decompress(net.readData(len))
+        end)
+        
+        net.receive("fileData", function()
+            net.readStream(function(stream)
+                file.writeTemp(SIGNATURE .. "_" .. lastFileName .. ".mp3", stream)
+                
+                net.start("ready")
+                net.send(nil, false)
+            end)
+        end)
+        
+        net.start("ready")
+        net.send(nil, false)
+    end
+
+    -- Every client receives the owner's live playback settings.
+    net.receive("settings", function()
+        local setting = net.readString()
+        local kind, value = string.match(setting, "^(%w+)|(.+)$")
+        value = tonumber(value)
+        if kind == "vol" and value then
+            VOLUME = math.max(0, math.min(10, value))
+        elseif kind == "pitch" and value then
+            PITCH = math.max(0.5, math.min(2, value))
+        end
+    end)
+    
+    timer.create("handleQueues", 0, 0, function()
+        if player() == owner() then
+            handleStreams()
+            handleHttpReqs()
+        end
+        handleTTS()
+    end)
+    
+    net.receive("tts", function(len)
+        len = math.ceil(len / 8)
+        local data = bit.stringToTable(bit.decompress(net.readData(len)))
+        
+        if #ttsQueue >= MAX_TTS_QUEUE then return end
+        table.insert(ttsQueue, data)
+        handleTTS()
+        
+        if player() != owner() then
+            local missingList = listMissingAudio(data)
+            
+            if #missingList > 0 then
+                local missingData = bit.compress(bit.tableToString(missingList))
+                    
+                net.start("request")
+                    net.writeData(missingData, #missingData)
+                net.send(nil, false)
+            end
+        end
+    end)
+end
